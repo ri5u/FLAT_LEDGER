@@ -69,8 +69,8 @@ model Expense {
   sourceRowNumber  Int?
   expenseDate      DateTime
   description      String
-  paidBy           Int
-  payer            User           @relation("PaidExpenses", fields: [paidBy], references: [id])
+  paidBy           Int?
+  payer            User?          @relation("PaidExpenses", fields: [paidBy], references: [id])
   amountInr        Decimal        @db.Decimal(12, 2)
   originalAmount   Decimal?       @db.Decimal(12, 2)
   originalCurrency String?
