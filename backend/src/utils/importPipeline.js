@@ -626,8 +626,8 @@ export function runHeuristicsClassifier(cleanedRows, knownMembers) {
  * Uses structured JSON outputs schema to ensure schema conformity.
  */
 export async function runGeminiClassifier(cleanedRows, knownMembers, apiKey) {
-  if (!apiKey) {
-    console.warn('GEMINI_API_KEY is not configured. Falling back to local heuristic classifier.');
+  if (!apiKey || apiKey === 'your-gemini-api-key-here') {
+    console.warn('GEMINI_API_KEY is not configured or is using placeholder. Falling back to local heuristic classifier.');
     return { reviewItems: runHeuristicsClassifier(cleanedRows, knownMembers), source: 'heuristic_fallback' };
   }
 
