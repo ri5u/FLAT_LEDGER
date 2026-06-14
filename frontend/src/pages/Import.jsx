@@ -521,7 +521,7 @@ export default function Import() {
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '32px' }}>
             <a 
-              href={`http://localhost:5000/api/imports/${batchId}/report?format=pdf`}
+              href={`http://localhost:5000/api/imports/${batchId}/report?format=pdf&token=${encodeURIComponent(localStorage.getItem('flat_ledger_token') || '')}`}
               target="_blank" 
               rel="noreferrer"
               className="btn btn-secondary"
@@ -531,7 +531,7 @@ export default function Import() {
             </a>
             
             <a 
-              href={`http://localhost:5000/api/imports/${batchId}/report?format=csv`}
+              href={`http://localhost:5000/api/imports/${batchId}/report?format=csv&token=${encodeURIComponent(localStorage.getItem('flat_ledger_token') || '')}`}
               download
               className="btn btn-secondary"
               style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px' }}
