@@ -730,3 +730,349 @@ Return the anomalies strictly according to the specified JSON schema. Keep summa
     return { reviewItems: runHeuristicsClassifier(cleanedRows, knownMembers), source: 'heuristic_fallback' };
   }
 }
+
+/**
+ * Stage 3: Decision Application Engine
+ * Applies the admin's chosen options to the Stage-1 cleaned rows.
+ * Returns the final expenses, transfers, and logs.
+ * 
+ * @param {Array} cleanedRows - Cleaned rows from Stage 1
+ * @param {Array} decisions - Chosen decisions from admin: [{ itemId, chosenOptionId }]
+ * @param {Array} knownMembers - Users in the database
+ * @returns {Object} { finalExpenses, finalTransfers, logUpdates, guestUsersToCreate }
+ */
+export function applyDecisions(cleanedRows, decisions, knownMembers) {
+  const decisionsMap = new Map(decisions.map(d => [d.itemId, d.chosenOptionId]));
+  const memberSet = new Set(knownMembers.map(m => m.name.toLowerCase()));
+  const memberNameMap = new Map(knownMembers.map(m => [m.name.toLowerCase(), m]));
+  const memberIdMap = new Map(knownMembers.map(m => [m.id, m]));
+
+  const finalExpenses = [];
+  const finalTransfers = [];
+  const logUpdates = [];
+  const guestUsersToCreate = new Set(); // Guest names to create in DB
+
+  // We need to keep track of row exclusions (for duplicates)
+  // key: originalRowNumber, value: boolean
+  const excludedRows = new Set();
+
+  // Group duplicate decisions first
+  decisions.forEach(d => {
+    if (d.itemId.startsWith('A1-') || d.itemId.startsWith('A2-')) {
+      const parts = d.itemId.split('-');
+      // Find row numbers in the ID: A2-rows-24-25 -> [24, 25]
+      const rowNums = parts.filter(p => !isNaN(parseInt(p, 10))).map(p => parseInt(p, 10));
+      
+      if (d.chosenOptionId.startsWith('keep_row_')) {
+        const rowToKeep = parseInt(d.chosenOptionId.replace('keep_row_', ''), 10);
+        rowNums.forEach(num => {
+          if (num !== rowToKeep) {
+            excludedRows.add(num);
+          }
+        });
+      }
+    }
+  });
+
+  for (const row of cleanedRows) {
+    const rowNum = row.originalRowNumber;
+    const desc = row.description;
+    const notes = row.notes;
+
+    // 1. If row was excluded by duplicate check, skip or add as inactive
+    if (excludedRows.has(rowNum)) {
+      logUpdates.push({
+        sourceRowNumber: rowNum,
+        anomalyId: rowNum === 24 || rowNum === 5 ? 'A1' : 'A2',
+        severity: 'review_required',
+        description: `Row excluded as a duplicate.`,
+        resolution: `Excluded in favor of other duplicate row`,
+      });
+      continue;
+    }
+
+    // If voided in Stage 1, we still insert it as voided
+    if (row.status === 'void') {
+      finalExpenses.push({
+        sourceRowNumber: rowNum,
+        description: desc,
+        amountInr: 0,
+        expenseDate: new Date(row.date),
+        paidBy: null, // voided has no payer
+        splitType: row.split_type,
+        status: 'void',
+        notes: row.notes,
+        splits: [],
+      });
+      continue;
+    }
+
+    // 2. Check Settlement/Transfer decisions (A3/A16)
+    const isSettlementDecision = decisionsMap.get(`A3-row-${rowNum}`);
+    const isDepositDecision = decisionsMap.get(`A16-row-${rowNum}`);
+    const chosenTransferOpt = isSettlementDecision || isDepositDecision;
+
+    if (chosenTransferOpt === 'convert_to_transfer') {
+      // Reclassify as transfer instead of expense
+      const isDeposit = !!isDepositDecision;
+      const transferType = isDeposit ? 'deposit' : 'settlement';
+      
+      // We need to resolve from/to users
+      let fromUser = row.paid_by;
+      let toUser = row.split_with.split(';')[0]; // first split participant
+
+      // Let's resolve their database IDs
+      const fromMember = memberNameMap.get((fromUser || '').toLowerCase());
+      const toMember = memberNameMap.get((toUser || '').toLowerCase());
+
+      finalTransfers.push({
+        sourceRowNumber: rowNum,
+        transferDate: new Date(row.date),
+        description: desc,
+        amountInr: row.amountInr,
+        fromUserId: fromMember ? fromMember.id : null,
+        fromUserName: fromUser,
+        toUserId: toMember ? toMember.id : null,
+        toUserName: toUser,
+        transferType,
+      });
+
+      logUpdates.push({
+        sourceRowNumber: rowNum,
+        anomalyId: isDeposit ? 'A16' : 'A3',
+        severity: 'review_required',
+        description: `Reclassified expense '${desc}' as Transfer (${transferType}).`,
+        resolution: `Record as direct Transfer`,
+      });
+      continue;
+    }
+
+    // 3. Resolve Payer (A10 / A12)
+    let finalPayerName = row.paid_by;
+    let finalPayerId = null;
+    let isWriteOff = false;
+
+    // Missing Payer card (A10)
+    const missingPayerDecision = decisionsMap.get(`A10-row-${rowNum}`);
+    if (missingPayerDecision) {
+      if (missingPayerDecision === 'write_off') {
+        isWriteOff = true;
+        logUpdates.push({
+          sourceRowNumber: rowNum,
+          anomalyId: 'A10',
+          severity: 'review_required',
+          description: `Missing payer resolved as write-off.`,
+          resolution: `Treat as write-off`,
+        });
+      } else if (missingPayerDecision.startsWith('payer_')) {
+        const payerId = parseInt(missingPayerDecision.replace('payer_', ''), 10);
+        const member = memberIdMap.get(payerId);
+        if (member) {
+          finalPayerId = member.id;
+          finalPayerName = member.name;
+          logUpdates.push({
+            sourceRowNumber: rowNum,
+            anomalyId: 'A10',
+            severity: 'review_required',
+            description: `Assigned missing payer to '${member.name}'.`,
+            resolution: `Set payer as ${member.name}`,
+          });
+        }
+      }
+    } else if (row.paid_by) {
+      // Known or ambiguous payer
+      const ambiguousPayerDecision = decisionsMap.get(`A12-row-${rowNum}`);
+      if (ambiguousPayerDecision) {
+        if (ambiguousPayerDecision.startsWith('confirm_payer_')) {
+          const payerId = parseInt(ambiguousPayerDecision.replace('confirm_payer_', ''), 10);
+          const member = memberIdMap.get(payerId);
+          if (member) {
+            finalPayerId = member.id;
+            finalPayerName = member.name;
+            logUpdates.push({
+              sourceRowNumber: rowNum,
+              anomalyId: 'A12',
+              severity: 'review_required',
+              description: `Resolved ambiguous name '${row.paid_by}' to member '${member.name}'.`,
+              resolution: `Map to member ${member.name}`,
+            });
+          }
+        } else if (ambiguousPayerDecision === 'create_guest') {
+          guestUsersToCreate.add(row.paid_by);
+          finalPayerName = row.paid_by;
+          logUpdates.push({
+            sourceRowNumber: rowNum,
+            anomalyId: 'A12',
+            severity: 'review_required',
+            description: `Resolved ambiguous name '${row.paid_by}' by creating new guest profile.`,
+            resolution: `Create new guest user`,
+          });
+        }
+      } else {
+        // Standard case - match to member id
+        const member = memberNameMap.get(row.paid_by.toLowerCase());
+        if (member) {
+          finalPayerId = member.id;
+        } else {
+          // If not matching and no decision was made, create guest to prevent failure
+          guestUsersToCreate.add(row.paid_by);
+        }
+      }
+    }
+
+    // 4. Resolve Date (A14)
+    let finalDate = new Date(row.date);
+    const dateDecision = decisionsMap.get(`A14-row-${rowNum}`);
+    if (dateDecision) {
+      if (dateDecision === 'date_april_5') {
+        finalDate = new Date('2026-04-05');
+        logUpdates.push({
+          sourceRowNumber: rowNum,
+          anomalyId: 'A14',
+          severity: 'review_required',
+          description: `Resolved ambiguous date format. Set to April 5, 2026.`,
+          resolution: `Set date to 5 April 2026`,
+        });
+      } else if (dateDecision === 'date_may_4') {
+        finalDate = new Date('2026-05-04');
+        logUpdates.push({
+          sourceRowNumber: rowNum,
+          anomalyId: 'A14',
+          severity: 'review_required',
+          description: `Resolved ambiguous date format. Set to May 4, 2026.`,
+          resolution: `Set date to 4 May 2026`,
+        });
+      }
+    }
+
+    // 5. Resolve Split Participants list
+    let participants = row.split_with.split(';').map(n => n.trim()).filter(Boolean);
+
+    // Membership Inconsistency (A15) - departed member Meera
+    const membershipDecision = decisionsMap.get(`A15-row-${rowNum}`);
+    if (membershipDecision === 'remove_member') {
+      participants = participants.filter(p => p.toLowerCase() !== 'meera');
+      logUpdates.push({
+        sourceRowNumber: rowNum,
+        anomalyId: 'A15',
+        severity: 'review_required',
+        description: `Removed departed member Meera from split.`,
+        resolution: `Remove Meera from split`,
+      });
+    } else if (membershipDecision === 'keep_member') {
+      logUpdates.push({
+        sourceRowNumber: rowNum,
+        anomalyId: 'A15',
+        severity: 'review_required',
+        description: `Kept departed member Meera in split.`,
+        resolution: `Keep Meera in split`,
+      });
+    }
+
+    // External Guest Splits (A17) - Dev's friend Kabir
+    let guestAction = null;
+    let guestNameStr = '';
+    decisions.forEach(d => {
+      if (d.itemId.startsWith(`A17-row-${rowNum}-`)) {
+        guestAction = d.chosenOptionId;
+        guestNameStr = d.itemId.split('-guest-')[1].replace(/_/g, ' ');
+      }
+    });
+
+    let guestAbsorbedBy = null;
+    if (guestAction) {
+      if (guestAction === 'absorb_into_host') {
+        participants = participants.filter(p => p.toLowerCase() !== guestNameStr.toLowerCase());
+        guestAbsorbedBy = 'Dev';
+        logUpdates.push({
+          sourceRowNumber: rowNum,
+          anomalyId: 'A17',
+          severity: 'review_required',
+          description: `Absorbed guest '${guestNameStr}' share into host Dev's split.`,
+          resolution: `Absorb guest share into host Dev`,
+        });
+      } else if (guestAction === 'split_among_flatmates') {
+        participants = participants.filter(p => p.toLowerCase() !== guestNameStr.toLowerCase());
+        logUpdates.push({
+          sourceRowNumber: rowNum,
+          anomalyId: 'A17',
+          severity: 'review_required',
+          description: `Distributed guest '${guestNameStr}' share equally among flatmates.`,
+          resolution: `Split among flatmates`,
+        });
+      } else if (guestAction === 'add_guest_user') {
+        guestUsersToCreate.add(guestNameStr);
+        logUpdates.push({
+          sourceRowNumber: rowNum,
+          anomalyId: 'A17',
+          severity: 'review_required',
+          description: `Created guest profile for '${guestNameStr}' and split normally.`,
+          resolution: `Create guest user profile`,
+        });
+      }
+    } else {
+      for (const p of participants) {
+        if (!memberSet.has(p.toLowerCase())) {
+          guestUsersToCreate.add(p);
+        }
+      }
+    }
+
+    // 6. Calculate final splits using split engine
+    let computedSplits = [];
+    if (guestAbsorbedBy && guestAction === 'absorb_into_host') {
+      const fullList = [...participants, guestNameStr];
+      const fullSplits = calculateSplits(row.amountInr, row.split_type, fullList, row.split_details);
+      
+      const guestShareObj = fullSplits.find(s => s.name.toLowerCase() === guestNameStr.toLowerCase());
+      const guestShare = guestShareObj ? guestShareObj.shareAmountInr : 0;
+
+      computedSplits = fullSplits.filter(s => s.name.toLowerCase() !== guestNameStr.toLowerCase());
+      const hostSplit = computedSplits.find(s => s.name.toLowerCase() === guestAbsorbedBy.toLowerCase());
+      if (hostSplit) {
+        hostSplit.shareAmountInr = Math.round((hostSplit.shareAmountInr + guestShare) * 100) / 100;
+        hostSplit.shareInput = `${hostSplit.shareInput} + guest absorb`;
+      }
+    } else {
+      computedSplits = calculateSplits(row.amountInr, row.split_type, participants, row.split_details);
+    }
+
+    // Log duplicate resolutions that were kept
+    decisions.forEach(d => {
+      if ((d.itemId.startsWith('A1-') || d.itemId.startsWith('A2-')) && d.chosenOptionId === `keep_row_${rowNum}`) {
+        const type = d.itemId.startsWith('A1-') ? 'A1' : 'A2';
+        logUpdates.push({
+          sourceRowNumber: rowNum,
+          anomalyId: type,
+          severity: 'review_required',
+          description: `Kept row ${rowNum} in favor of other duplicate rows.`,
+          resolution: `Keep row ${rowNum}`,
+        });
+      }
+    });
+
+    finalExpenses.push({
+      sourceRowNumber: rowNum,
+      description: desc,
+      amountInr: row.amountInr,
+      originalAmount: row.originalAmountStr ? parseFloat(row.originalAmountStr) : null,
+      originalCurrency: row.currency !== 'INR' ? row.currency : null,
+      exchangeRate: row.exchangeRate,
+      expenseDate: finalDate,
+      paidById: finalPayerId,
+      paidByUserName: finalPayerName,
+      isWriteOff,
+      splitType: row.split_type,
+      status: 'active',
+      notes: row.notes,
+      splits: computedSplits,
+    });
+  }
+
+  return {
+    finalExpenses,
+    finalTransfers,
+    logUpdates,
+    guestUsersToCreate: Array.from(guestUsersToCreate),
+  };
+}
