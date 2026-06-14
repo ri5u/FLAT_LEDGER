@@ -8,8 +8,10 @@ RUN npm run build
 
 # Stage 2: Setup Express Backend
 FROM node:20-slim
+RUN apt-get update -y && apt-get install -y openssl ca-certificates
 WORKDIR /app
 COPY backend/package*.json ./
+
 RUN npm install
 COPY backend/prisma ./prisma/
 RUN npx prisma generate
