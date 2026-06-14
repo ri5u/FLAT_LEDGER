@@ -1,0 +1,109 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id            Int            @id @default(autoincrement())
+  name          String         @unique
+  email         String?        @unique
+  passwordHash  String?
+  role          String         @default("member") // admin, member, guest
+  isGuest       Boolean        @default(false)
+  createdAt     DateTime       @default(now())
+  memberships   Membership[]
+  paidExpenses  Expense[]      @relation("PaidExpenses")
+  splits        ExpenseSplit[]
+  sentTransfers Transfer[]     @relation("SentTransfers")
+  recvTransfers Transfer[]     @relation("RecvTransfers")
+}
+
+model Membership {
+  id             Int          @id @default(autoincrement())
+  userId         Int
+  user           User         @relation(fields: [userId], references: [id])
+  joinedDate     DateTime
+  leftDate       DateTime?
+  source         String       @default("manual") // manual, import
+  sourceImportId Int?
+  notes          String?
+}
+
+model ImportBatch {
+  id               Int          @id @default(autoincrement())
+  uploadedBy       Int
+  uploadedAt       DateTime     @default(now())
+  originalFilename String
+  rawCsv           String
+  status           String       @default("pending_review") // pending_review, committed, aborted
+  llmResponse      Json?
+  committedAt      DateTime?
+  logs             ImportLog[]
+  expenses         Expense[]
+  transfers        Transfer[]
+}
+
+model ImportLog {
+  id              Int         @id @default(autoincrement())
+  importBatchId   Int
+  importBatch     ImportBatch @relation(fields: [importBatchId], references: [id])
+  sourceRowNumber Int
+  anomalyId       String?
+  severity        String      // auto_fixed, review_required
+  description     String
+  originalValue   Json?
+  resolvedValue   Json?
+  resolution      String?     // choice selected by admin
+  resolvedBy      Int?
+  resolvedAt      DateTime?
+}
+
+model Expense {
+  id               Int            @id @default(autoincrement())
+  importBatchId    Int?
+  importBatch      ImportBatch?   @relation(fields: [importBatchId], references: [id])
+  sourceRowNumber  Int?
+  expenseDate      DateTime
+  description      String
+  paidBy           Int
+  payer            User           @relation("PaidExpenses", fields: [paidBy], references: [id])
+  amountInr        Decimal        @db.Decimal(12, 2)
+  originalAmount   Decimal?       @db.Decimal(12, 2)
+  originalCurrency String?
+  exchangeRate     Decimal?       @db.Decimal(10, 6)
+  splitType        String         @default("equal") // equal, percentage, share, unequal
+  status           String         @default("active") // active, void, excluded_duplicate
+  notes            String?
+  createdAt        DateTime       @default(now())
+  splits           ExpenseSplit[]
+}
+
+model ExpenseSplit {
+  id             Int     @id @default(autoincrement())
+  expenseId      Int
+  expense        Expense @relation(fields: [expenseId], references: [id])
+  userId         Int
+  user           User    @relation(fields: [userId], references: [id])
+  shareAmountInr Decimal @db.Decimal(12, 2)
+  shareInput     String? // e.g. "30%", "2 shares", "700"
+}
+
+model Transfer {
+  id              Int          @id @default(autoincrement())
+  importBatchId   Int?
+  importBatch     ImportBatch? @relation(fields: [importBatchId], references: [id])
+  sourceRowNumber Int?
+  transferDate    DateTime
+  fromUserId      Int
+  fromUser        User         @relation("SentTransfers", fields: [fromUserId], references: [id])
+  toUserId        Int
+  toUser          User         @relation("RecvTransfers", fields: [toUserId], references: [id])
+  amountInr       Decimal      @db.Decimal(12, 2)
+  description     String
+  transferType    String       @default("settlement") // settlement, deposit
+  createdAt       DateTime     @default(now())
+}

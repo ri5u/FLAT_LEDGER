@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: flat_ledger_db
+    restart: always
+    environment:
+      POSTGRES_USER: flat_ledger_user
+      POSTGRES_PASSWORD: flat_ledger_password
+      POSTGRES_DB: flat_ledger
+    ports:
+      - "5400:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: flat_ledger_backend
+    restart: always
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - DATABASE_URL=postgresql://flat_ledger_user:flat_ledger_password@db:5432/flat_ledger?schema=public
+      - JWT_SECRET=super_secret_flat_ledger_token_secret
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
